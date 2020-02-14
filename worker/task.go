@@ -861,7 +861,7 @@ func (qs *queryState) helpProcessTask(ctx context.Context, q *pb.Query, gid uint
 		return nil, errors.Errorf("Predicate %s doesn't have reverse edge", attr)
 	}
 
-	if needsIndex(srcFn.fnType, q.UidList) && !schema.State().IsIndexed(q.Attr) {
+	if needsIndex(srcFn.fnType, q.UidList) && !schema.State().IsIndexed(schema.ReadCtx, q.Attr) {
 		return nil, errors.Errorf("Predicate %s is not indexed", q.Attr)
 	}
 
@@ -1023,7 +1023,7 @@ func (qs *queryState) handleRegexFunction(ctx context.Context, arg funcArgs) err
 	if typ != types.StringID {
 		return errors.Errorf("Got non-string type. Regex match is allowed only on string type.")
 	}
-	useIndex := schema.State().HasTokenizer(tok.IdentTrigram, attr)
+	useIndex := schema.State().HasTokenizer(schema.ReadCtx, tok.IdentTrigram, attr)
 	span.Annotatef(nil, "Trigram index found: %t, func at root: %t",
 		useIndex, arg.srcFn.isFuncAtRoot)
 
@@ -1265,7 +1265,7 @@ func (qs *queryState) handleMatchFunction(ctx context.Context, arg funcArgs) err
 	case arg.q.UidList != nil && len(arg.q.UidList.Uids) != 0:
 		uids = arg.q.UidList
 
-	case schema.State().HasTokenizer(tok.IdentTrigram, attr):
+	case schema.State().HasTokenizer(schema.ReadCtx, tok.IdentTrigram, attr):
 		var err error
 		uids, err = uidsForMatch(attr, arg)
 		if err != nil {
@@ -1571,7 +1571,7 @@ func parseSrcFn(q *pb.Query) (*functionContext, error) {
 	fnType, f := parseFuncType(q.SrcFunc)
 	attr := q.Attr
 	fc := &functionContext{fnType: fnType, fname: f}
-	isIndexedAttr := schema.State().IsIndexed(attr)
+	isIndexedAttr := schema.State().IsIndexed(schema.ReadCtx, attr)
 	var err error
 
 	t, err := schema.State().TypeOf(attr)

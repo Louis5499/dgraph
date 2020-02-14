@@ -18,25 +18,44 @@ package schema
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"sync"
 
-	"github.com/dgraph-io/badger/v2"
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
+	"github.com/pkg/errors"
 	"golang.org/x/net/trace"
 
+	"github.com/dgraph-io/badger/v2"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/tok"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
-	"github.com/pkg/errors"
 )
 
 var (
 	pstate *state
 	pstore *badger.DB
+)
+
+type contextKey int
+
+const (
+	isWrite contextKey = iota
+)
+
+// GetWriteContext returns a context that sets the schema context for writting.
+func GetWriteContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, isWrite, true)
+}
+
+var (
+	// WriteCtx is used to get the schema used for writing.
+	WriteCtx = GetWriteContext(context.Background())
+	// ReadCtx is used to get the schema used for reading.
+	ReadCtx = context.Background()
 )
 
 func (s *state) init() {
@@ -51,6 +70,7 @@ type state struct {
 	predicate map[string]*pb.SchemaUpdate
 	types     map[string]*pb.TypeUpdate
 	elog      trace.EventLog
+	ongoing   map[string][]string
 }
 
 // State returns the struct holding the current schema.
@@ -68,6 +88,10 @@ func (s *state) DeleteAll() {
 
 	for typ := range s.types {
 		delete(s.types, typ)
+	}
+
+	for pred := range s.ongoing {
+		delete(s.ongoing, pred)
 	}
 }
 
@@ -87,6 +111,7 @@ func (s *state) Delete(attr string) error {
 	}
 
 	delete(s.predicate, attr)
+	delete(s.ongoing, attr)
 	return nil
 }
 
@@ -181,13 +206,12 @@ func (s *state) TypeOf(pred string) (types.TypeID, error) {
 }
 
 // IsIndexed returns whether the predicate is indexed or not
-func (s *state) IsIndexed(pred string) bool {
+func (s *state) IsIndexed(ctx context.Context, pred string) bool {
+	isWrite, _ := ctx.Value(isWrite).(bool)
 	s.RLock()
 	defer s.RUnlock()
-	if schema, ok := s.predicate[pred]; ok {
-		return len(schema.Tokenizer) > 0
-	}
-	return false
+	schema, ok := s.predicate[pred]
+	return (ok && len(schema.Tokenizer) > 0) || (isWrite && len(s.ongoing[pred]) > 0)
 }
 
 // IndexedFields returns the list of indexed fields
@@ -226,7 +250,8 @@ func (s *state) Types() []string {
 }
 
 // Tokenizer returns the tokenizer for given predicate
-func (s *state) Tokenizer(pred string) []tok.Tokenizer {
+func (s *state) Tokenizer(ctx context.Context, pred string) []tok.Tokenizer {
+	isWrite, _ := ctx.Value(isWrite).(bool)
 	s.RLock()
 	defer s.RUnlock()
 	schema, ok := s.predicate[pred]
@@ -237,13 +262,22 @@ func (s *state) Tokenizer(pred string) []tok.Tokenizer {
 		x.AssertTruef(found, "Invalid tokenizer %s", it)
 		tokenizers = append(tokenizers, t)
 	}
+	if !isWrite {
+		return tokenizers
+	}
+
+	for _, it := range s.ongoing[pred] {
+		t, found := tok.GetTokenizer(it)
+		x.AssertTruef(found, "Invalid tokenizer %s", it)
+		tokenizers = append(tokenizers, t)
+	}
 	return tokenizers
 }
 
 // TokenizerNames returns the tokenizer names for given predicate
-func (s *state) TokenizerNames(pred string) []string {
+func (s *state) TokenizerNames(ctx context.Context, pred string) []string {
 	var names []string
-	tokenizers := s.Tokenizer(pred)
+	tokenizers := s.Tokenizer(ctx, pred)
 	for _, t := range tokenizers {
 		names = append(names, t.Name())
 	}
@@ -252,8 +286,8 @@ func (s *state) TokenizerNames(pred string) []string {
 
 // HasTokenizer is a convenience func that checks if a given tokenizer is found in pred.
 // Returns true if found, else false.
-func (s *state) HasTokenizer(id byte, pred string) bool {
-	for _, t := range s.Tokenizer(pred) {
+func (s *state) HasTokenizer(ctx context.Context, id byte, pred string) bool {
+	for _, t := range s.Tokenizer(ctx, pred) {
 		if t.Identifier() == id {
 			return true
 		}

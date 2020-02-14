@@ -115,26 +115,7 @@ func runMutation(ctx context.Context, edge *pb.DirectedEdge, txn *posting.Txn) e
 	return plist.AddMutationWithIndex(ctx, edge, txn)
 }
 
-// This is serialized with mutations, called after applied watermarks catch up
-// and further mutations are blocked until this is done.
 func runSchemaMutation(ctx context.Context, update *pb.SchemaUpdate, startTs uint64) error {
-	if err := runSchemaMutationHelper(ctx, update, startTs); err != nil {
-		// on error, we restore the memory state to be the same as the disk
-		maxRetries := 10
-		loadErr := x.RetryUntilSuccess(maxRetries, 10*time.Millisecond, func() error {
-			return schema.Load(update.Predicate)
-		})
-
-		if loadErr != nil {
-			glog.Fatalf("failed to load schema after %d retries: %v", maxRetries, loadErr)
-		}
-		return err
-	}
-
-	return updateSchema(update)
-}
-
-func runSchemaMutationHelper(ctx context.Context, update *pb.SchemaUpdate, startTs uint64) error {
 	if tablet, err := groups().Tablet(update.Predicate); err != nil {
 		return err
 	} else if tablet.GetGroupId() != groups().groupId() {
@@ -144,30 +125,55 @@ func runSchemaMutationHelper(ctx context.Context, update *pb.SchemaUpdate, start
 	if err := checkSchema(update); err != nil {
 		return err
 	}
+
 	old, _ := schema.State().Get(update.Predicate)
 	// Sets only in memory, we will update it on disk only after schema mutations
-	// are successful and  written to disk.
+	// are successful and written to disk.
 	schema.State().Set(update.Predicate, update)
 
-	// Once we remove index or reverse edges from schema, even though the values
-	// are present in db, they won't be used due to validation in work/task.go
-
-	// We don't want to use sync watermarks for background removal, because it would block
-	// linearizable read requests. Only downside would be on system crash, stale edges
-	// might remain, which is ok.
-
-	// Indexing can't be done in background as it can cause race conditons with new
-	// index mutations (old set and new del)
-	// We need watermark for index/reverse edge addition for linearizable reads.
-	// (both applied and synced watermarks).
-	defer glog.Infof("Done schema update %+v\n", update)
 	rebuild := posting.IndexRebuild{
 		Attr:          update.Predicate,
 		StartTs:       startTs,
 		OldSchema:     &old,
 		CurrentSchema: update,
 	}
-	return rebuild.Run(ctx)
+	if err := rebuild.DropIndexes(ctx); err != nil {
+		return err
+	}
+	if err := rebuild.BuildData(ctx); err != nil {
+		return err
+	}
+
+	go func() {
+		complete := false
+		defer func() {
+			if complete {
+				return
+			}
+
+			maxRetries := 10
+			loadErr := x.RetryUntilSuccess(maxRetries, 10*time.Millisecond, func() error {
+				return schema.Load(update.Predicate)
+			})
+
+			if loadErr != nil {
+				glog.Fatalf("failed to load schema after %d retries: %v", maxRetries, loadErr)
+			}
+		}()
+
+		if err := rebuild.BuildIndexes(ctx); err != nil {
+			glog.Errorf("error in building indexes in background, aborting :: %v\n", err)
+			return
+		}
+		if err := updateSchema(update); err != nil {
+			glog.Errorf("error in updating schema, aborting :: %v\n", err)
+			return
+		}
+		glog.Infof("Done schema update %+v\n", update)
+		complete = true
+	}()
+
+	return nil
 }
 
 // updateSchema commits the schema to disk in blocking way, should be ok because this happens
